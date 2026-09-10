@@ -1,0 +1,198 @@
+name: Test bootc PR 2290 sealed Composefs
+
+on:
+  workflow_dispatch:
+    inputs:
+      bootc_ref:
+        description: bootc ref to build (the default is PR 2290)
+        required: true
+        default: refs/pull/2290/head
+        type: string
+      qemu_source:
+        description: QEMU package source
+        required: true
+        default: resolute
+        type: choice
+        options:
+          - resolute
+          - stock
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # This workflow deliberately cannot be triggered by an untrusted PR.
+    if: github.event_name == 'workflow_dispatch' && github.actor == github.repository_owner
+    name: Sealed Composefs on QEMU (${{ inputs.qemu_source }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      BOOTC_base: quay.io/centos-bootc/centos-bootc:stream9
+      BOOTC_variant: composefs
+      BOOTC_bootloader: systemd
+      BOOTC_filesystem: ext4
+      BOOTC_boot_type: uki
+      BOOTC_seal_state: sealed
+      CARGO_INCREMENTAL: '0'
+      TMT_LOG_DIR: /tmp/bootc-tmt
+
+    steps:
+      - name: Checkout actions
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Checkout bootc
+        uses: actions/checkout@v7
+        with:
+          repository: bootc-dev/bootc
+          ref: ${{ inputs.bootc_ref }}
+          path: bootc
+          persist-credentials: false
+
+      - name: Add guest kernel identity to TMT logs
+        shell: bash
+        working-directory: bootc
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("tmt/tests/booted/test-image-upgrade-reboot.nu")
+          source = path.read_text()
+          marker = "bootc status\n"
+          if source.count(marker) != 1 or "uname -a\n" in source:
+              raise SystemExit(f"unexpected test source shape: {path}")
+          path.write_text(source.replace(marker, "uname -a\n" + marker, 1))
+          PY
+
+      - name: Set up Ubuntu host
+        uses: ./bootc-ubuntu-setup
+        with:
+          libvirt: true
+
+      - name: Install Resolute QEMU
+        if: inputs.qemu_source == 'resolute'
+        shell: bash
+        working-directory: bootc
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            'Package: *' \
+            'Pin: release n=resolute' \
+            'Pin-Priority: 50' | sudo tee /etc/apt/preferences.d/resolute-qemu
+          printf '%s\n' \
+            'deb https://archive.ubuntu.com/ubuntu resolute main universe' | \
+            sudo tee /etc/apt/sources.list.d/resolute-qemu.list
+          timeout --foreground --signal=TERM --kill-after=30s 5m sudo apt-get update
+          timeout --foreground --signal=TERM --kill-after=30s 5m \
+            sudo apt-get -t resolute install -y --no-install-recommends \
+              qemu-system-x86 qemu-utils qemu-system-common qemu-system-data
+          installed=$(dpkg-query -W -f='${Version}' qemu-system-x86)
+          test "${installed}" = '1:10.2.1+ds-1ubuntu3'
+
+      - name: Install Python venv support
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --foreground --signal=TERM --kill-after=30s 5m \
+            sudo apt-get install -y --no-install-recommends python3-venv
+
+      - name: Capture host metadata
+        if: always()
+        shell: bash
+        working-directory: bootc
+        run: |
+          set +e
+          mkdir -p "$RUNNER_TEMP/bootc-artifacts"
+          {
+            printf 'source_commit '
+            git rev-parse HEAD
+            printf 'qemu_executable '
+            qemu-system-x86_64 --version
+            printf 'qemu_binary '
+             command -v qemu-system-x86_64
+             sha256sum "$(command -v qemu-system-x86_64)"
+            ldd "$(command -v qemu-system-x86_64)"
+            printf 'qemu_packages\n'
+            dpkg-query -W -f='${binary:Package} ${Version}\n' \
+              qemu-system-x86 qemu-system-common qemu-system-data qemu-utils
+            printf 'qemu_policy\n'
+            apt-cache policy qemu-system-x86
+          } > "$RUNNER_TEMP/bootc-artifacts/metadata.txt" 2>&1
+
+      - name: Install tmt in an isolated venv
+        shell: bash
+        working-directory: bootc
+        run: |
+          set -euo pipefail
+          # Pinned to the version used by bootc CI; reboot handling is sensitive.
+          python3 -m venv "$RUNNER_TEMP/tmt-venv"
+          "$RUNNER_TEMP/tmt-venv/bin/python" -m pip install \
+            'tmt[provision-virtual]==1.74.0'
+          echo "$RUNNER_TEMP/tmt-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Build the sealed image
+        shell: bash
+        working-directory: bootc
+        run: |
+          set -xeuo pipefail
+          # Package separately so the test recipes can reuse these RPMs.
+          timeout --foreground --signal=TERM --kill-after=30s 40m just package
+          timeout --foreground --signal=TERM --kill-after=30s 25m \
+            env BOOTC_SKIP_PACKAGE=1 just build
+
+      - name: Test the sealed image through reboot
+        shell: bash
+        working-directory: bootc
+        run: |
+          set -xeuo pipefail
+          # This canonical recipe provisions a disk, installs the image, and
+          # verifies the subsequent boot. It also builds the upgrade image.
+          timeout --foreground --signal=TERM --kill-after=30s 15m \
+            env BOOTC_SKIP_PACKAGE=1 just test-composefs systemd ext4 uki sealed
+
+      - name: Collect allowlisted diagnostics
+        if: always()
+        shell: bash
+        working-directory: bootc
+        run: |
+          set +e
+          if podman image exists localhost/bootc; then
+            podman image inspect localhost/bootc --format 'image_id {{.Id}}' \
+              >> "$RUNNER_TEMP/bootc-artifacts/metadata.txt"
+          fi
+          test -d "$TMT_LOG_DIR" || exit 0
+
+          # TMT's guest console/journal/test transcripts are useful; do not
+          # upload arbitrary files, keys, or the checkout. Keep artifact size bounded.
+          total=0
+          while IFS= read -r -d '' file; do
+            base=${file##*/}
+            case "$base" in
+              console.txt|journal.txt|output.txt|output.log|testout.txt|error.log) ;;
+              *) continue ;;
+            esac
+            case "$base" in
+              *.pem|*id_rsa*|*private*|*secret*) continue ;;
+            esac
+            if grep -aEq 'BEGIN ([A-Z]+ )?PRIVATE KEY|id_rsa' "$file"; then
+              continue
+            fi
+            size=$(stat -c '%s' "$file")
+            [ "$size" -le 10485760 ] || continue
+            [ $((total + size)) -le 52428800 ] || break
+            rel=${file#"$TMT_LOG_DIR"/}
+            mkdir -p "$RUNNER_TEMP/bootc-artifacts/tmt/${rel%/*}"
+            cp -- "$file" "$RUNNER_TEMP/bootc-artifacts/tmt/$rel"
+            total=$((total + size))
+          done < <(find "$TMT_LOG_DIR" -type f -print0)
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bootc-pr2290-composefs-${{ inputs.qemu_source }}
+          path: ${{ runner.temp }}/bootc-artifacts
+          retention-days: 7
