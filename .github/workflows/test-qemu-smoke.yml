@@ -62,7 +62,16 @@ jobs:
             grep -Eq 'qemu-system-x86 .*(^|:)10\.2\.1' \
               "$RUNNER_TEMP/qemu-smoke/qemu-packages.txt"
           fi
-          test -f /usr/share/qemu/efi-virtio.rom
+          rom=
+          for candidate in /usr/share/qemu/efi-virtio.rom /usr/lib/ipxe/qemu/efi-virtio.rom; do
+            if [[ -f "$candidate" ]]; then
+              rom=$candidate
+              break
+            fi
+          done
+          test -n "$rom"
+          dpkg-query -S "$rom" >>"$RUNNER_TEMP/qemu-smoke/qemu-packages.txt"
+          printf 'QEMU_EFI_VIRTIO_ROM=%s\n' "$rom" >>"$GITHUB_ENV"
 
       - name: Verify host QEMU and KVM
         shell: bash
@@ -79,8 +88,8 @@ jobs:
             qemu-system-x86_64 -machine help
             printf 'vhost_user_fs_help\n'
             qemu-system-x86_64 -device vhost-user-fs-pci,help
-            printf 'efi_virtio_rom\n'
-            sha256sum /usr/share/qemu/efi-virtio.rom
+            printf 'efi_virtio_rom=%s\n' "$QEMU_EFI_VIRTIO_ROM"
+            sha256sum "$QEMU_EFI_VIRTIO_ROM"
             printf 'kvm\n'
             stat -c 'path=%n mode=%a owner=%U group=%G' /dev/kvm
             printf 'bcvk_help\n'
