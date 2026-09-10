@@ -90,10 +90,14 @@ runs:
       shell: bash
       run: |
         set -xeuo pipefail
-        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-        sudo udevadm control --reload-rules
-        sudo udevadm trigger --name-match=kvm
-        ls -l /dev/kvm
+        if [ -c /dev/kvm ]; then
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+        else
+          printf 'No /dev/kvm character device; skipping KVM permission setup.\n'
+        fi
     # Used by a few workflows, but generally useful
     - name: Set architecture variable
       id: set_arch
@@ -105,24 +109,116 @@ runs:
       shell: bash
       run: |
         set -xeuo pipefail
-        # renovate: datasource=github-releases depName=bootc-dev/bcvk
-        export BCVK_VERSION=0.19.0
         # see https://github.com/bootc-dev/bcvk/issues/176
         /bin/time -f '%E %C' sudo apt install -y libkrb5-dev pkg-config libvirt-dev genisoimage qemu-utils qemu-kvm virtiofsd libvirt-daemon-system python3-virt-firmware
+
+    # bcvk requires KVM and v0.19.0 has no arm64 release asset.
+    - name: Install bcvk
+      if: ${{ inputs.libvirt == 'true' && runner.arch == 'X64' }}
+      shell: bash
+      run: |
+        set -xeuo pipefail
+        # renovate: datasource=github-releases depName=bootc-dev/bcvk
+        export BCVK_VERSION=0.19.0
         # Something in the stack is overriding this, but we want session right now for bcvk
         echo LIBVIRT_DEFAULT_URI=qemu:///session >> $GITHUB_ENV
         td=$(mktemp -d)
         cd $td
         # Install bcvk
         target=bcvk-$(arch)-unknown-linux-gnu
-        /bin/time -f '%E %C' curl --retry 35 --retry-delay 30 --retry-max-time 1200 -LO https://github.com/bootc-dev/bcvk/releases/download/v${BCVK_VERSION}/${target}.tar.gz
-        tar xzf ${target}.tar.gz
-        sudo install -T ${target} /usr/bin/bcvk
+        /bin/time -f '%E %C' curl --fail --show-error --location --retry 35 --retry-delay 30 --retry-max-time 1200 --output "${target}.tar.gz" "https://github.com/bootc-dev/bcvk/releases/download/v${BCVK_VERSION}/${target}.tar.gz"
+        tar xzf "${target}.tar.gz"
+        sudo install -T "${target}" /usr/bin/bcvk
         cd -
         rm -rf "$td"
 
         # Also bump the default fd limit as a workaround for https://github.com/bootc-dev/bcvk/issues/65
         sudo sed -i -e 's,^\* hard nofile 65536,* hard nofile 524288,' /etc/security/limits.conf
+    # Ubuntu 24.04's QEMU loses virtiofs IRQ notifications.  Use the fixed
+    # package from Resolute on Ubuntu 24.04 for the disposable CI host; the
+    # Ubuntu 26.04 setup may provide its own native stack.  This is the same
+    # race investigated in https://github.com/bootc-dev/bootc/pull/2290:
+    # https://github.com/qemu/qemu/commit/1ba9a5220325dd5260a0c37b6299ce38364a5120
+    - name: Install fixed QEMU from Ubuntu Resolute
+      if: ${{ inputs.libvirt == 'true' }}
+      shell: bash
+      run: |
+        set -xeuo pipefail
+        idv=$(. /usr/lib/os-release && printf '%s-%s' "$ID" "$VERSION_ID")
+        if [ "$idv" != ubuntu-24.04 ]; then
+          printf 'Skipping Resolute QEMU setup on %s\n' "$idv"
+          exit 0
+        fi
+        case "$(dpkg --print-architecture)" in
+          amd64)
+            qemu_package=qemu-system-x86
+            ;;
+          arm64)
+            qemu_package=qemu-system-arm
+            ;;
+          *)
+            printf 'Unsupported architecture for Resolute QEMU: %s\n' \
+              "$(dpkg --print-architecture)" >&2
+            exit 1
+            ;;
+        esac
+        qemu_binary="qemu-system-$(uname -m)"
+
+        # Keep Resolute below the normal candidate for every package.  The
+        # explicitly requested QEMU packages still bring their dependency
+        # closure (including glibc 2.43); that is acceptable on this
+        # disposable CI runner; copying just the executable would leave its
+        # runtime libraries behind.
+        printf '%s\n' \
+          'Package: *' \
+          'Pin: release n=resolute' \
+          'Pin-Priority: 50' | sudo tee /etc/apt/preferences.d/resolute-qemu >/dev/null
+
+        if [ "$(dpkg --print-architecture)" = amd64 ]; then
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            mirror='mirror+file:/etc/apt/apt-mirrors.txt'
+          else
+            mirror='http://archive.ubuntu.com/ubuntu'
+          fi
+        else
+          mirror='http://ports.ubuntu.com/ubuntu-ports'
+        fi
+        printf 'deb %s resolute main universe\n' "$mirror" | \
+          sudo tee /etc/apt/sources.list.d/resolute-qemu.list >/dev/null
+        timeout --foreground --signal=TERM --kill-after=30s 5m sudo apt-get update
+
+        # Keep ipxe-qemu in this explicit target transaction: its ROM must
+        # match the QEMU userspace rather than the older package from Plucky.
+        timeout --foreground --signal=TERM --kill-after=30s 5m \
+          sudo apt-get -t resolute install -y --no-install-recommends \
+            "$qemu_package" qemu-system-common qemu-system-data qemu-utils ipxe-qemu
+
+        printf 'Selected QEMU: %s\n' "$qemu_binary"
+        "$qemu_binary" --version
+        dpkg-query -W -f='${binary:Package} ${Version}\n' \
+          "$qemu_package" qemu-system-common qemu-system-data qemu-utils ipxe-qemu
+        rom=
+        if [ "$(dpkg --print-architecture)" = amd64 ]; then
+          rom_names=(efi-virtio.rom)
+        else
+          rom_names=(efi-aa64.rom efi-virtio.rom)
+        fi
+        for rom_name in "${rom_names[@]}"; do
+          for candidate in "/usr/share/qemu/$rom_name" "/usr/lib/ipxe/qemu/$rom_name"; do
+            if [ -f "$candidate" ]; then
+              rom=$candidate
+              break
+            fi
+          done
+          [ -n "$rom" ] && break
+        done
+        if [ -n "$rom" ]; then
+          printf 'EFI ROM: %s (%s)\n' "$rom" "$(dpkg-query -S "$rom")"
+          sha256sum "$rom"
+        else
+          printf 'No expected EFI ROM found after installing ipxe-qemu\n' >&2
+          exit 1
+        fi
     - name: Cleanup status
       shell: bash
       run: |
