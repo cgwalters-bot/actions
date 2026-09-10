@@ -46,7 +46,7 @@ jobs:
             timeout --foreground --signal=TERM --kill-after=30s 5m sudo apt-get update
             timeout --foreground --signal=TERM --kill-after=30s 5m \
               sudo apt-get -t resolute install -y --no-install-recommends \
-                qemu-system-x86 qemu-system-common qemu-system-data qemu-utils
+                qemu-system-x86 qemu-system-common qemu-system-data qemu-utils ipxe-qemu
           else
             timeout --foreground --signal=TERM --kill-after=30s 5m \
               sudo apt-get install -y --no-install-recommends \
@@ -57,9 +57,12 @@ jobs:
             qemu-system-x86 qemu-system-common qemu-system-data qemu-utils \
             >"$RUNNER_TEMP/qemu-smoke/qemu-packages.txt"
           if [[ '${{ inputs.qemu_source }}' == resolute ]]; then
+            dpkg-query -W -f='${binary:Package} ${Version}\n' ipxe-qemu \
+              >>"$RUNNER_TEMP/qemu-smoke/qemu-packages.txt"
             grep -Eq 'qemu-system-x86 .*(^|:)10\.2\.1' \
               "$RUNNER_TEMP/qemu-smoke/qemu-packages.txt"
           fi
+          test -f /usr/share/qemu/efi-virtio.rom
 
       - name: Verify host QEMU and KVM
         shell: bash
@@ -76,6 +79,8 @@ jobs:
             qemu-system-x86_64 -machine help
             printf 'vhost_user_fs_help\n'
             qemu-system-x86_64 -device vhost-user-fs-pci,help
+            printf 'efi_virtio_rom\n'
+            sha256sum /usr/share/qemu/efi-virtio.rom
             printf 'kvm\n'
             stat -c 'path=%n mode=%a owner=%U group=%G' /dev/kvm
             printf 'bcvk_help\n'
@@ -130,13 +135,30 @@ jobs:
           trap cleanup EXIT
 
           set +e
-          timeout --foreground --signal=TERM --kill-after=30s 180s \
-            bcvk ephemeral run --name "$name" --console \
-              --execute "sh -c 'uname -a; true'" \
+          timeout --foreground --signal=TERM --kill-after=10s 90s \
+            bcvk ephemeral run -d -K --name "$name" --console \
               --log-dir "journal,console=$log_dir" "$image" \
               >"$artifact_dir/launcher.log" 2>&1
-          main_status=$?
+          launcher_status=$?
+          main_status=$launcher_status
+          if [[ "$launcher_status" -eq 0 ]]; then
+            deadline=$((SECONDS + 90))
+            main_status=1
+            while [[ "$SECONDS" -lt "$deadline" ]]; do
+              timeout --foreground --signal=TERM --kill-after=2s 10s \
+                bcvk ephemeral ssh "$name" 'uname -a && true' \
+                >"$artifact_dir/guest-command.log" 2>&1
+              ssh_status=$?
+              if [[ "$ssh_status" -eq 0 ]] && \
+                grep -Eq '^Linux ' "$artifact_dir/guest-command.log"; then
+                main_status=0
+                break
+              fi
+              sleep 2
+            done
+          fi
           set -e
+          printf '%s\n' "$launcher_status" >"$artifact_dir/launcher-exit-status.txt"
           printf '%s\n' "$main_status" >"$artifact_dir/main-exit-status.txt"
 
           # Keep the failed container around while collecting bounded, allowlisted
