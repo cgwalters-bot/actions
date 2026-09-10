@@ -1,0 +1,168 @@
+name: QEMU ephemeral smoke test
+
+on:
+  workflow_dispatch:
+    inputs:
+      qemu_source:
+        description: QEMU package source
+        required: true
+        default: stock
+        type: choice
+        options:
+          - stock
+          - resolute
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    if: github.actor == github.repository_owner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout actions
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Ubuntu host
+        uses: ./bootc-ubuntu-setup
+        with:
+          libvirt: true
+
+      - name: Install selected QEMU packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ '${{ inputs.qemu_source }}' == resolute ]]; then
+            printf '%s\n' \
+              'Package: *' \
+              'Pin: release n=resolute' \
+              'Pin-Priority: 50' | sudo tee /etc/apt/preferences.d/resolute-qemu >/dev/null
+            printf '%s\n' \
+              'deb https://archive.ubuntu.com/ubuntu resolute main universe' | \
+              sudo tee /etc/apt/sources.list.d/resolute-qemu.list >/dev/null
+            timeout --foreground --signal=TERM --kill-after=30s 5m sudo apt-get update
+            timeout --foreground --signal=TERM --kill-after=30s 5m \
+              sudo apt-get -t resolute install -y --no-install-recommends \
+                qemu-system-x86 qemu-system-common qemu-system-data qemu-utils
+          else
+            timeout --foreground --signal=TERM --kill-after=30s 5m \
+              sudo apt-get install -y --no-install-recommends \
+                qemu-system-x86 qemu-system-common qemu-system-data qemu-utils
+          fi
+          mkdir -p "$RUNNER_TEMP/qemu-smoke"
+          dpkg-query -W -f='${binary:Package} ${Version}\n' \
+            qemu-system-x86 qemu-system-common qemu-system-data qemu-utils \
+            >"$RUNNER_TEMP/qemu-smoke/qemu-packages.txt"
+          if [[ '${{ inputs.qemu_source }}' == resolute ]]; then
+            grep -Eq 'qemu-system-x86 .*(^|:)10\.2\.1' \
+              "$RUNNER_TEMP/qemu-smoke/qemu-packages.txt"
+          fi
+
+      - name: Verify host QEMU and KVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_dir="$RUNNER_TEMP/qemu-smoke"
+          qemu=$(command -v qemu-system-x86_64)
+          {
+            printf 'qemu_path=%s\n' "$qemu"
+            qemu-system-x86_64 --version
+            printf 'qemu_sha256='; sha256sum "$qemu"
+            ldd "$qemu"
+            printf 'machine_help\n'
+            qemu-system-x86_64 -machine help
+            printf 'vhost_user_fs_help\n'
+            qemu-system-x86_64 -device vhost-user-fs-pci,help
+            printf 'kvm\n'
+            stat -c 'path=%n mode=%a owner=%U group=%G' /dev/kvm
+            printf 'bcvk_help\n'
+            bcvk --help
+            printf 'bcvk_version\n'
+            bcvk --version
+          } >"$artifact_dir/host-metadata.txt" 2>&1
+          if ldd "$qemu" | grep -q 'not found'; then
+            printf 'qemu has missing shared libraries\n' >&2
+            exit 1
+          fi
+          test -r /dev/kvm -a -w /dev/kvm
+          qemu-system-x86_64 -machine help | grep -Eq '(^|[[:space:]])q35([[:space:]]|$)'
+
+      - name: Pull smoke image and record digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          image=quay.io/centos-bootc/centos-bootc:stream9
+          timeout --foreground --signal=TERM --kill-after=30s 5m podman pull -q "$image"
+          podman image inspect "$image" --format '{{.RepoDigests}}' \
+            >"$RUNNER_TEMP/qemu-smoke/image-digest.txt"
+
+      - name: Run ephemeral VM
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_dir="$RUNNER_TEMP/qemu-smoke"
+          log_dir="$artifact_dir/vm-logs"
+          name="qemu-smoke-${GITHUB_RUN_ID}"
+          image=quay.io/centos-bootc/centos-bootc:stream9
+          log_limit=5242880
+          mkdir -p "$log_dir"
+
+          limit_log() {
+            local log=$1
+            local size
+            [[ -f "$log" ]] || return 0
+            size=$(stat -c %s "$log")
+            if [[ "$size" -gt "$log_limit" ]]; then
+              truncate --size="$log_limit" "$log"
+            fi
+          }
+
+          # shellcheck disable=SC2317 # invoked by the EXIT trap below
+          cleanup() {
+            timeout --foreground --signal=TERM --kill-after=5s 20s \
+              podman stop --time 20 "$name" >/dev/null 2>&1 || :
+            timeout --foreground --signal=TERM --kill-after=5s 10s \
+              podman rm -f "$name" >/dev/null 2>&1 || :
+          }
+          trap cleanup EXIT
+
+          set +e
+          timeout --foreground --signal=TERM --kill-after=30s 180s \
+            bcvk ephemeral run --name "$name" --console \
+              --execute "sh -c 'uname -a; true'" \
+              --log-dir "journal,console=$log_dir" "$image" \
+              >"$artifact_dir/launcher.log" 2>&1
+          main_status=$?
+          set -e
+          printf '%s\n' "$main_status" >"$artifact_dir/main-exit-status.txt"
+
+          # Keep the failed container around while collecting bounded, allowlisted
+          # diagnostics. Do not use --rm: pre-boot QEMU errors are otherwise lost.
+          timeout --foreground --signal=TERM --kill-after=5s 10s \
+            podman inspect "$name" \
+            --format 'image={{.Config.Image}} path={{.Path}} args={{json .Args}} state={{json .State}}' \
+            >"$artifact_dir/container-state.txt" 2>&1 || :
+          timeout --foreground --signal=TERM --kill-after=5s 10s \
+            podman logs "$name" >"$artifact_dir/container.log" 2>&1 || :
+          limit_log "$artifact_dir/launcher.log"
+          limit_log "$artifact_dir/container.log"
+          for vm_log in "$log_dir"/journal.json "$log_dir"/journal-initrd.json \
+            "$log_dir"/console.txt; do
+            limit_log "$vm_log"
+          done
+
+          if [[ "$main_status" -ne 0 ]]; then
+            printf 'bcvk ephemeral run failed with status %s\n' "$main_status" >&2
+          fi
+          exit "$main_status"
+
+      - name: Upload smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: qemu-ephemeral-smoke-${{ inputs.qemu_source }}
+          path: ${{ runner.temp }}/qemu-smoke
+          retention-days: 7
