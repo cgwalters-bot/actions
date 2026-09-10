@@ -1,0 +1,152 @@
+name: Test virtualization setup
+
+on:
+  pull_request:
+    paths:
+      - bootc-ubuntu-setup/action.yml
+      - .github/workflows/test-virtualization.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qemu-smoke:
+    name: 'QEMU smoke: ${{ matrix.name }}'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            architecture: amd64
+            name: amd64 virtiofs (KVM required)
+            full_vm_smoke: true
+          - runner: ubuntu-24.04-arm
+            architecture: arm64
+            name: arm64 QEMU startup (TCG)
+            full_vm_smoke: false
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    steps:
+      - name: Checkout actions
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Ubuntu host
+        uses: ./bootc-ubuntu-setup
+        with:
+          libvirt: true
+
+      - name: Verify host QEMU and select acceleration
+        id: qemu
+        shell: bash
+        env:
+          FULL_VM_SMOKE: ${{ matrix.full_vm_smoke }}
+        run: |
+          set -euo pipefail
+          qemu="qemu-system-$(uname -m)"
+          "$qemu" --version
+          if [ "$(uname -m)" = x86_64 ]; then
+            machine=q35
+          else
+            machine=virt
+          fi
+          "$qemu" -machine help | grep -Eq "(^|[[:space:]])${machine}([[:space:]]|$)"
+          if [ "$FULL_VM_SMOKE" = true ]; then
+            if ! [ -c /dev/kvm ] || ! [ -r /dev/kvm ] || ! [ -w /dev/kvm ]; then
+              printf 'KVM is required for the full VM smoke, but /dev/kvm is unavailable.\n' >&2
+              exit 1
+            fi
+            echo 'full_vm_smoke=true' >> "$GITHUB_OUTPUT"
+          else
+            # bcvk requires KVM and is not available for arm64.  Always use TCG
+            # here, even if a future arm64 runner exposes /dev/kvm.
+            printf 'Smoke testing QEMU startup with TCG.\n'
+            tcg_status=0
+            timeout --foreground --signal=TERM --kill-after=5s 10s \
+              "$qemu" -machine "${machine},accel=tcg" -display none -nodefaults -S || \
+              tcg_status=$?
+            if [ "$tcg_status" -ne 124 ]; then
+              printf 'QEMU TCG smoke expected timeout status 124, got %s.\n' "$tcg_status" >&2
+              exit 1
+            fi
+            echo 'full_vm_smoke=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pull smoke image
+        if: ${{ steps.qemu.outputs.full_vm_smoke == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image=quay.io/centos-bootc/centos-bootc:stream9
+          timeout --foreground --signal=TERM --kill-after=30s 5m podman pull -q "$image"
+          podman image inspect "$image" --format '{{.RepoDigests}}' >"$RUNNER_TEMP/image-digest.txt"
+
+      - name: Run ephemeral VM
+        if: ${{ steps.qemu.outputs.full_vm_smoke == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_dir="$RUNNER_TEMP/qemu-smoke"
+          log_dir="$artifact_dir/vm-logs"
+          name="qemu-smoke-${GITHUB_RUN_ID}"
+          mkdir -p "$log_dir"
+          limit_log() {
+            local log=$1
+            if [ -f "$log" ] && [ "$(stat -c %s "$log")" -gt 5242880 ]; then
+              truncate --size=5242880 "$log"
+            fi
+          }
+          # shellcheck disable=SC2317 # invoked by the EXIT trap below
+          cleanup() {
+            timeout --foreground --signal=TERM --kill-after=5s 20s podman stop --time 20 "$name" >/dev/null 2>&1 || :
+            timeout --foreground --signal=TERM --kill-after=5s 10s podman rm -f "$name" >/dev/null 2>&1 || :
+          }
+          trap cleanup EXIT
+
+          set +e
+          timeout --foreground --signal=TERM --kill-after=10s 90s \
+            bcvk ephemeral run -d -K --name "$name" --console \
+              --log-dir "journal,console=$log_dir" \
+              quay.io/centos-bootc/centos-bootc:stream9 \
+              >"$artifact_dir/launcher.log" 2>&1
+          launcher_status=$?
+          main_status=$launcher_status
+          if [ "$launcher_status" -eq 0 ]; then
+            deadline=$((SECONDS + 90))
+            main_status=1
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              if timeout --foreground --signal=TERM --kill-after=2s 10s \
+                bcvk ephemeral ssh "$name" 'uname -a && true' \
+                >"$artifact_dir/guest-command.log" 2>&1; then
+                ssh_status=0
+              else
+                ssh_status=$?
+              fi
+              if [ "$ssh_status" -eq 0 ] && grep -Eq '^Linux ' "$artifact_dir/guest-command.log"; then
+                main_status=0
+                break
+              fi
+              sleep 2
+            done
+          fi
+          printf '%s\n' "$launcher_status" >"$artifact_dir/launcher-exit-status.txt"
+          printf '%s\n' "$main_status" >"$artifact_dir/main-exit-status.txt"
+          timeout --foreground --signal=TERM --kill-after=5s 10s podman logs "$name" >"$artifact_dir/container.log" 2>&1 || :
+          limit_log "$artifact_dir/launcher.log"
+          limit_log "$artifact_dir/container.log"
+          for log in "$log_dir"/journal.json "$log_dir"/journal-initrd.json "$log_dir"/console.txt; do
+            limit_log "$log"
+          done
+          exit "$main_status"
+
+      - name: Upload smoke diagnostics
+        if: ${{ always() && steps.qemu.outputs.full_vm_smoke == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: qemu-virtiofs-smoke-${{ matrix.architecture }}
+          path: |
+            ${{ runner.temp }}/qemu-smoke
+            ${{ runner.temp }}/image-digest.txt
+          retention-days: 7
