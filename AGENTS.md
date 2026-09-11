@@ -56,6 +56,12 @@ the commit message text.
 
 ## Code guidelines
 
+### Scripting
+
+Use Node.js for nontrivial scripts (more than 10 lines) rather than shell.
+Keep shell snippets only when they are genuinely small and clearer than a
+Node.js equivalent.
+
 The [REVIEW.md](REVIEW.md) file describes expectations around
 testing, code quality, commit messages, commit organization, etc.
 Language-specific guidelines are in
