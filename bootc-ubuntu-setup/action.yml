@@ -233,6 +233,19 @@ runs:
           printf 'No expected EFI ROM found after installing ipxe-qemu\n' >&2
           exit 1
         fi
+    - name: Keep CI bwrap children in the parent AppArmor profile
+      shell: bash
+      run: |
+        if sudo test -r /etc/apparmor.d/bwrap-userns-restrict &&
+           sudo test -r /sys/kernel/security/apparmor/profiles &&
+           sudo grep -qx 'bwrap (enforce)' /sys/kernel/security/apparmor/profiles; then
+          sudo tee /etc/apparmor.d/local/bwrap-userns-restrict >/dev/null <<'EOF'
+        priority=100 allow file rwlkm /**,
+        priority=100 allow ix /**,
+        EOF
+          sudo apparmor_parser -Q /etc/apparmor.d/bwrap-userns-restrict
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+        fi
     - name: Cleanup status
       shell: bash
       run: |
