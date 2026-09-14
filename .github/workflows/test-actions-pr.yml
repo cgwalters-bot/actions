@@ -20,10 +20,64 @@ jobs:
 
       - name: Verify setup
         run: |
-          podman --version
           just --version
           test -n "$ARCH"
 
+      - name: Verify basic requirements
+        uses: ./.github/actions/verify-basic-requirements
+
+  test-bootc-ubuntu-setup-2604:
+    name: Test bootc-ubuntu-setup (26.04)
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Run bootc-ubuntu-setup
+        uses: ./bootc-ubuntu-setup
+
+      - name: Verify setup
+        run: |
+          just --version
+          test -n "$ARCH"
+
+      - name: Verify basic requirements
+        uses: ./.github/actions/verify-basic-requirements
+
+      - name: Verify podman heredoc support
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir=$(mktemp -d)
+          cat > "${dir}/Containerfile" <<'CEOF'
+          FROM docker.io/library/alpine:latest
+          RUN <<EOF
+          echo "heredoc works" > /heredoc-test.txt
+          EOF
+          CEOF
+          podman build -t localhost/heredoc-test:latest -f "${dir}/Containerfile" "${dir}"
+          result="$(podman run --rm localhost/heredoc-test:latest cat /heredoc-test.txt)"
+          test "${result}" = "heredoc works"
+
+      - name: Verify bwrap AppArmor transition
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 3m \
+            podman run --rm -i --cap-add=all \
+              --security-opt=label=type:container_runtime_t --device /dev/fuse \
+              quay.io/centos-bootc/centos-bootc:stream9 bash -euxo pipefail <<'CONTAINER'
+          mkdir /bwrap-tmp
+          touch /bwrap-tmp/parent
+          chown 1:1 /bwrap-tmp/parent
+          bwrap --bind / / --proc /proc --dev /dev /bin/bash -euxo pipefail -c '
+            label=$(cat /proc/self/attr/current)
+            test "$label" = "bwrap (enforce)"
+            touch /bwrap-tmp/child
+            chown 1:1 /bwrap-tmp/child
+            test "$(stat -c %u:%g /bwrap-tmp/child)" = 1:1
+          '
+          CONTAINER
   test-setup-rust:
     name: Test setup-rust
     runs-on: ubuntu-latest
